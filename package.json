@@ -1,0 +1,26 @@
+{
+  "name": "integrations-sandbox",
+  "version": "1.0.0",
+  "description": "Local integration sandbox for simulating retries, rate limits, pagination, and partial failures.",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "cli": "tsx src/index.ts",
+    "start": "tsx src/index.ts serve --scenario happy-path --port 4010",
+    "simulate": "tsx src/index.ts simulate --scenario happy-path",
+    "test": "vitest run"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bin": {
+    "integrations-sandbox": "./dist/src/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.7"
+  }
+}
