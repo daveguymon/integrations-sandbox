@@ -1,16 +1,29 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { getScenarioOrThrow, type Contact, type ScenarioDefinition } from "./scenarios.js";
+import { getScenarioOrThrow, type Contact, type PaginationMode, type ScenarioDefinition } from "./scenarios.js";
 
-export interface ContactsPageResponse {
+interface BaseContactsResponse {
   scenario: string;
   service: string;
-  page: number;
+  paginationMode: PaginationMode;
   pageSize: number;
   total: number;
   items: Contact[];
+}
+
+export interface OffsetContactsPageResponse extends BaseContactsResponse {
+  paginationMode: "page";
+  page: number;
   nextPage: number | null;
 }
+
+export interface CursorContactsResponse extends BaseContactsResponse {
+  paginationMode: "cursor";
+  cursor: string | null;
+  nextCursor: string | null;
+}
+
+export type ContactsResponse = OffsetContactsPageResponse | CursorContactsResponse;
 
 export interface BatchSyncRequest {
   ids: string[];
@@ -23,6 +36,25 @@ export interface BatchSyncResponse {
   acceptedIds: string[];
   failed: Array<{ id: string; reason: string }>;
   partial: boolean;
+}
+
+export interface TokenResponse {
+  accessToken: string;
+  tokenType: "Bearer";
+  expiresInSeconds: number;
+}
+
+export interface WebhookDeliveryRequest {
+  eventId: string;
+  ids: string[];
+}
+
+export interface WebhookDeliveryResponse {
+  scenario: string;
+  service: string;
+  eventId: string;
+  accepted: boolean;
+  attempt: number;
 }
 
 export interface SandboxRequestLog {
@@ -47,14 +79,22 @@ export interface RunningSandboxServer {
 
 interface ScenarioRuntimeState {
   contactsAttemptCount: number;
+  contactsSuccessCount: number;
   batchAttemptCount: number;
+  webhookAttemptCount: number;
+  tokenIssueCount: number;
+  firstTokenExpired: boolean;
 }
 
 export function createSandboxServer(options: SandboxServerOptions): Promise<RunningSandboxServer> {
   const scenario = getScenarioOrThrow(options.scenarioId);
   const state: ScenarioRuntimeState = {
     contactsAttemptCount: 0,
-    batchAttemptCount: 0
+    contactsSuccessCount: 0,
+    batchAttemptCount: 0,
+    webhookAttemptCount: 0,
+    tokenIssueCount: 0,
+    firstTokenExpired: false
   };
 
   const server = createServer((request, response) => {
@@ -108,7 +148,23 @@ async function handleRequest(args: {
     return;
   }
 
+  if (method === "POST" && url.pathname === "/auth/token") {
+    state.tokenIssueCount += 1;
+    const payload: TokenResponse = {
+      accessToken: issueAccessToken(state.tokenIssueCount),
+      tokenType: "Bearer",
+      expiresInSeconds: scenario.behavior.authExpiresFirstToken && state.tokenIssueCount === 1 ? 0 : 3600
+    };
+
+    sendLoggedJson(response, 200, payload, method, path, scenario.id, onRequestLog);
+    return;
+  }
+
   if (method === "GET" && url.pathname === "/contacts") {
+    if (rejectUnauthorizedRequest({ request, response, scenario, state, method, path, onRequestLog })) {
+      return;
+    }
+
     state.contactsAttemptCount += 1;
     const statusOverride = getListFailureStatus(scenario, state.contactsAttemptCount);
 
@@ -148,30 +204,42 @@ async function handleRequest(args: {
       return;
     }
 
-    const page = parsePositiveInteger(url.searchParams.get("page"), 1, "page");
     const pageSize = parsePositiveInteger(
       url.searchParams.get("pageSize"),
       scenario.defaultPageSize,
       "pageSize"
     );
-    const startIndex = (page - 1) * pageSize;
-    const items = scenario.contacts.slice(startIndex, startIndex + pageSize);
-    const nextPage = startIndex + pageSize < scenario.contacts.length ? page + 1 : null;
-    const payload: ContactsPageResponse = {
-      scenario: scenario.id,
-      service: scenario.serviceName,
-      page,
-      pageSize,
-      total: scenario.contacts.length,
-      items,
-      nextPage
-    };
+    const payload = buildContactsResponse({ scenario, url, pageSize });
+    state.contactsSuccessCount += 1;
+
+    if (scenario.behavior.malformedContactsSuccessNumber === state.contactsSuccessCount) {
+      sendLoggedJson(
+        response,
+        200,
+        {
+          scenario: scenario.id,
+          service: scenario.serviceName,
+          paginationMode: scenario.behavior.paginationMode,
+          total: scenario.contacts.length,
+          brokenItems: payload.items
+        },
+        method,
+        path,
+        scenario.id,
+        onRequestLog
+      );
+      return;
+    }
 
     sendLoggedJson(response, 200, payload, method, path, scenario.id, onRequestLog);
     return;
   }
 
   if (method === "POST" && url.pathname === "/contacts/batch-sync") {
+    if (rejectUnauthorizedRequest({ request, response, scenario, state, method, path, onRequestLog })) {
+      return;
+    }
+
     state.batchAttemptCount += 1;
     const body = await readJsonBody(request);
 
@@ -205,7 +273,159 @@ async function handleRequest(args: {
     return;
   }
 
+  if (method === "POST" && url.pathname === "/webhooks/outbound") {
+    state.webhookAttemptCount += 1;
+    const body = await readJsonBody(request);
+
+    if (!isWebhookDeliveryRequest(body)) {
+      sendLoggedJson(
+        response,
+        400,
+        { error: "Request body must be JSON with eventId and ids fields." },
+        method,
+        path,
+        scenario.id,
+        onRequestLog
+      );
+      return;
+    }
+
+    if (state.webhookAttemptCount <= scenario.behavior.webhookFailuresBeforeSuccess) {
+      sendLoggedJson(
+        response,
+        502,
+        {
+          error: "Webhook receiver temporary failure",
+          retryable: true,
+          attempt: state.webhookAttemptCount
+        },
+        method,
+        path,
+        scenario.id,
+        onRequestLog
+      );
+      return;
+    }
+
+    const payload: WebhookDeliveryResponse = {
+      scenario: scenario.id,
+      service: scenario.serviceName,
+      eventId: body.eventId,
+      accepted: true,
+      attempt: state.webhookAttemptCount
+    };
+
+    sendLoggedJson(response, 202, payload, method, path, scenario.id, onRequestLog);
+    return;
+  }
+
   sendLoggedJson(response, 404, { error: "Route not found" }, method, path, scenario.id, onRequestLog);
+}
+
+function rejectUnauthorizedRequest(args: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  scenario: ScenarioDefinition;
+  state: ScenarioRuntimeState;
+  method: string;
+  path: string;
+  onRequestLog?: (entry: SandboxRequestLog) => void;
+}): boolean {
+  const { request, response, scenario, state, method, path, onRequestLog } = args;
+
+  if (!scenario.behavior.requiresAuth) {
+    return false;
+  }
+
+  const authHeader = request.headers.authorization;
+  const tokenVersion = parseBearerTokenVersion(authHeader);
+
+  if (tokenVersion === null) {
+    response.setHeader("WWW-Authenticate", 'Bearer realm="sandbox", error="invalid_token"');
+    sendLoggedJson(
+      response,
+      401,
+      { error: "Missing or invalid bearer token", retryable: false },
+      method,
+      path,
+      scenario.id,
+      onRequestLog
+    );
+    return true;
+  }
+
+  if (scenario.behavior.authExpiresFirstToken && tokenVersion === 1 && !state.firstTokenExpired) {
+    state.firstTokenExpired = true;
+    response.setHeader("WWW-Authenticate", 'Bearer realm="sandbox", error="invalid_token", error_description="expired"');
+    sendLoggedJson(
+      response,
+      401,
+      { error: "Bearer token expired", retryable: true },
+      method,
+      path,
+      scenario.id,
+      onRequestLog
+    );
+    return true;
+  }
+
+  if (tokenVersion > state.tokenIssueCount) {
+    response.setHeader("WWW-Authenticate", 'Bearer realm="sandbox", error="invalid_token"');
+    sendLoggedJson(
+      response,
+      401,
+      { error: "Unknown bearer token", retryable: false },
+      method,
+      path,
+      scenario.id,
+      onRequestLog
+    );
+    return true;
+  }
+
+  return false;
+}
+
+function buildContactsResponse(args: {
+  scenario: ScenarioDefinition;
+  url: URL;
+  pageSize: number;
+}): ContactsResponse {
+  const { scenario, url, pageSize } = args;
+
+  if (scenario.behavior.paginationMode === "cursor") {
+    const cursor = url.searchParams.get("cursor");
+    const startIndex = parseCursor(cursor);
+    const items = scenario.contacts.slice(startIndex, startIndex + pageSize);
+    const nextIndex = startIndex + pageSize;
+
+    return {
+      scenario: scenario.id,
+      service: scenario.serviceName,
+      paginationMode: "cursor",
+      cursor,
+      pageSize,
+      total: scenario.contacts.length,
+      items,
+      nextCursor: nextIndex < scenario.contacts.length ? encodeCursor(nextIndex) : null
+    };
+  }
+
+  const page = parsePositiveInteger(url.searchParams.get("page"), 1, "page");
+  const startIndex = (page - 1) * pageSize;
+  const items = scenario.contacts.slice(startIndex, startIndex + pageSize);
+  const nextPage = startIndex + pageSize < scenario.contacts.length ? page + 1 : null;
+
+  return {
+    scenario: scenario.id,
+    service: scenario.serviceName,
+    paginationMode: "page",
+    page,
+    pageSize,
+    total: scenario.contacts.length,
+    items,
+    nextPage
+  };
 }
 
 function getListFailureStatus(scenario: ScenarioDefinition, attempt: number): 429 | 500 | null {
@@ -237,6 +457,42 @@ function parsePositiveInteger(rawValue: string | null, fallback: number, label: 
   return parsedValue;
 }
 
+function parseCursor(cursor: string | null): number {
+  if (cursor === null) {
+    return 0;
+  }
+
+  const match = /^cursor_(\d+)$/.exec(cursor);
+
+  if (!match) {
+    throw new Error(`Invalid cursor "${cursor}". Expected the sandbox cursor format.`);
+  }
+
+  return Number.parseInt(match[1], 10);
+}
+
+function encodeCursor(index: number): string {
+  return `cursor_${index}`;
+}
+
+function issueAccessToken(issueCount: number): string {
+  return `sandbox-token-v${issueCount}`;
+}
+
+function parseBearerTokenVersion(authorizationHeader: string | undefined): number | null {
+  if (!authorizationHeader) {
+    return null;
+  }
+
+  const match = /^Bearer sandbox-token-v(\d+)$/.exec(authorizationHeader);
+
+  if (!match) {
+    return null;
+  }
+
+  return Number.parseInt(match[1], 10);
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
 
@@ -258,6 +514,19 @@ function isBatchSyncRequest(value: unknown): value is BatchSyncRequest {
 
   const ids = value.ids;
   return Array.isArray(ids) && ids.every((entry) => typeof entry === "string");
+}
+
+function isWebhookDeliveryRequest(value: unknown): value is WebhookDeliveryRequest {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("eventId" in value) ||
+    !("ids" in value)
+  ) {
+    return false;
+  }
+
+  return typeof value.eventId === "string" && Array.isArray(value.ids) && value.ids.every((entry) => typeof entry === "string");
 }
 
 function sendLoggedJson(

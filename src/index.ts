@@ -34,7 +34,7 @@ async function main(): Promise<void> {
         maxRetries
       });
       console.log(formatSimulationReport(report));
-      process.exitCode = report.partial ? 2 : 0;
+      process.exitCode = report.errorMessage !== null ? 1 : report.partial ? 2 : 0;
       return;
     }
 
@@ -49,7 +49,7 @@ async function main(): Promise<void> {
           console.log(`[server] ${entry.method} ${entry.path} -> ${entry.statusCode}`);
         }
       });
-      console.log(formatServeBanner({ scenarioId, baseUrl: server.baseUrl }));
+      console.log(formatServeBanner({ scenario: server.scenario, baseUrl: server.baseUrl }));
 
       const shutdown = async (): Promise<void> => {
         console.log("\nShutting down sandbox server...");

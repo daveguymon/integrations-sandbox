@@ -4,10 +4,18 @@ export interface Contact {
   email: string;
 }
 
+export type PaginationMode = "page" | "cursor";
+
 export interface ScenarioBehavior {
+  paginationMode: PaginationMode;
   serverErrorsBeforeSuccess: number;
   rateLimitsBeforeSuccess: number;
   partialFailureIds: string[];
+  malformedContactsSuccessNumber: number | null;
+  enableWebhookDelivery: boolean;
+  webhookFailuresBeforeSuccess: number;
+  requiresAuth: boolean;
+  authExpiresFirstToken: boolean;
 }
 
 export interface ScenarioDefinition {
@@ -29,6 +37,21 @@ const CONTACT_FIXTURE: Contact[] = [
   { id: "contact_6", name: "Annie Easley", email: "annie@example.test" }
 ];
 
+function createBehavior(overrides: Partial<ScenarioBehavior> = {}): ScenarioBehavior {
+  return {
+    paginationMode: "page",
+    serverErrorsBeforeSuccess: 0,
+    rateLimitsBeforeSuccess: 0,
+    partialFailureIds: [],
+    malformedContactsSuccessNumber: null,
+    enableWebhookDelivery: false,
+    webhookFailuresBeforeSuccess: 0,
+    requiresAuth: false,
+    authExpiresFirstToken: false,
+    ...overrides
+  };
+}
+
 export const scenarios: ScenarioDefinition[] = [
   {
     id: "happy-path",
@@ -37,11 +60,7 @@ export const scenarios: ScenarioDefinition[] = [
     serviceName: "sandbox-crm",
     defaultPageSize: 2,
     contacts: CONTACT_FIXTURE,
-    behavior: {
-      serverErrorsBeforeSuccess: 0,
-      rateLimitsBeforeSuccess: 0,
-      partialFailureIds: []
-    }
+    behavior: createBehavior()
   },
   {
     id: "flaky-retries",
@@ -50,11 +69,9 @@ export const scenarios: ScenarioDefinition[] = [
     serviceName: "sandbox-crm",
     defaultPageSize: 2,
     contacts: CONTACT_FIXTURE,
-    behavior: {
-      serverErrorsBeforeSuccess: 2,
-      rateLimitsBeforeSuccess: 0,
-      partialFailureIds: []
-    }
+    behavior: createBehavior({
+      serverErrorsBeforeSuccess: 2
+    })
   },
   {
     id: "rate-limit-recover",
@@ -63,11 +80,9 @@ export const scenarios: ScenarioDefinition[] = [
     serviceName: "sandbox-crm",
     defaultPageSize: 2,
     contacts: CONTACT_FIXTURE,
-    behavior: {
-      serverErrorsBeforeSuccess: 0,
-      rateLimitsBeforeSuccess: 1,
-      partialFailureIds: []
-    }
+    behavior: createBehavior({
+      rateLimitsBeforeSuccess: 1
+    })
   },
   {
     id: "partial-batch-failure",
@@ -76,11 +91,9 @@ export const scenarios: ScenarioDefinition[] = [
     serviceName: "sandbox-crm",
     defaultPageSize: 2,
     contacts: CONTACT_FIXTURE,
-    behavior: {
-      serverErrorsBeforeSuccess: 0,
-      rateLimitsBeforeSuccess: 0,
+    behavior: createBehavior({
       partialFailureIds: ["contact_2", "contact_5"]
-    }
+    })
   },
   {
     id: "mixed-chaos",
@@ -89,11 +102,57 @@ export const scenarios: ScenarioDefinition[] = [
     serviceName: "sandbox-crm",
     defaultPageSize: 2,
     contacts: CONTACT_FIXTURE,
-    behavior: {
+    behavior: createBehavior({
       serverErrorsBeforeSuccess: 1,
       rateLimitsBeforeSuccess: 1,
       partialFailureIds: ["contact_5"]
-    }
+    })
+  },
+  {
+    id: "cursor-pagination",
+    title: "Cursor pagination",
+    description: "The contacts API uses opaque cursors instead of numbered pages.",
+    serviceName: "sandbox-crm",
+    defaultPageSize: 2,
+    contacts: CONTACT_FIXTURE,
+    behavior: createBehavior({
+      paginationMode: "cursor"
+    })
+  },
+  {
+    id: "webhook-retries",
+    title: "Webhook retries",
+    description: "Outbound webhook delivery fails twice with 502 before eventually succeeding.",
+    serviceName: "sandbox-crm",
+    defaultPageSize: 2,
+    contacts: CONTACT_FIXTURE,
+    behavior: createBehavior({
+      enableWebhookDelivery: true,
+      webhookFailuresBeforeSuccess: 2
+    })
+  },
+  {
+    id: "auth-expiry",
+    title: "Auth expiry recovery",
+    description: "The first issued bearer token expires immediately, requiring a token refresh and retry.",
+    serviceName: "sandbox-crm",
+    defaultPageSize: 2,
+    contacts: CONTACT_FIXTURE,
+    behavior: createBehavior({
+      requiresAuth: true,
+      authExpiresFirstToken: true
+    })
+  },
+  {
+    id: "malformed-payload",
+    title: "Malformed payload",
+    description: "The first successful contacts response is malformed so the client must surface a parsing error.",
+    serviceName: "sandbox-crm",
+    defaultPageSize: 2,
+    contacts: CONTACT_FIXTURE,
+    behavior: createBehavior({
+      malformedContactsSuccessNumber: 1
+    })
   }
 ];
 
