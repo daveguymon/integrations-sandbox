@@ -2,7 +2,7 @@
 
 Small local app for simulating messy external-service integration behavior such as retries, rate limits, numbered and cursor-based pagination, auth expiry, webhook retries, malformed payloads, and partial failures.
 
-For a teaching-oriented explanation of what each failure mode means and how resilient integrations should respond, see [failure-modes.md](/Users/daveguymon/portfolio/integrations-sandbox/docs/failure-modes.md).
+For a teaching-oriented explanation of what each failure mode means and how resilient integrations should respond, see [failure-modes.md](docs/failure-modes.md).
 
 ## Install
 
